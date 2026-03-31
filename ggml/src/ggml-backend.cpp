@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <functional>
+#include <thread>
 #include <vector>
 
 #ifdef __APPLE__
@@ -27,6 +30,53 @@
 #include <sys/sysctl.h>
 #endif
 
+
+// ---------------------------------------------------------------------------
+// WorkerThread: lightweight persistent thread used by the scheduler to run
+// a CPU split concurrently with a GPU split (CPU+GPU parallel FFN).
+// ---------------------------------------------------------------------------
+struct SchedWorkerThread {
+    std::thread               thr;
+    std::function<void()>     task;
+    std::atomic<bool>         has_task{false};
+    std::atomic<bool>         done{false};
+    std::atomic<bool>         stop{false};
+
+    SchedWorkerThread() : thr([this]() {
+        while (!stop.load(std::memory_order_acquire)) {
+            while (!has_task.load(std::memory_order_acquire)) {
+                if (stop.load(std::memory_order_acquire)) return;
+                std::this_thread::yield();
+            }
+            task();
+            has_task.store(false, std::memory_order_release);
+            done.store(true,  std::memory_order_release);
+        }
+    }) {}
+
+    ~SchedWorkerThread() {
+        // Signal stop; the inner spin loop checks stop and returns without
+        // calling task() (which would be empty at destruction time).
+        stop.store(true, std::memory_order_release);
+        if (thr.joinable()) thr.join();
+    }
+
+    void submit(std::function<void()> fn) {
+        done.store(false, std::memory_order_release);
+        task = std::move(fn);
+        has_task.store(true, std::memory_order_release);
+    }
+
+    void join() {
+        while (!done.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+};
+
+static SchedWorkerThread s_sched_cpu_worker;
+
+// ---------------------------------------------------------------------------
 
 // backend buffer type
 
@@ -1209,7 +1259,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
-            if (node_backend_id != cur_backend_id || need_new_split) {
+            // Also force a new split when GGML_TENSOR_FLAG_SCHED_BREAK is set on the
+            // node (used by CPU+GPU parallel FFN to separate GPU-attn/norm from GPU-FFN).
+            bool sched_break = !ggml_is_view_op(node->op) && (node->flags & GGML_TENSOR_FLAG_SCHED_BREAK);
+            if (node_backend_id != cur_backend_id || need_new_split || sched_break) {
                 split->i_end = i;
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
@@ -1578,7 +1631,78 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        // -----------------------------------------------------------------------
+        // CPU+GPU parallel FFN: if the current split is GPU and the next split
+        // is CPU, and the CPU split's inputs are independent of this GPU split,
+        // we can run them concurrently.
+        // -----------------------------------------------------------------------
+        bool do_parallel = false;
+        int par_next_id = split_id + 1;
+        ggml_backend_sched_split * par_next = nullptr;
+        int par_next_backend_id = -1;
+        ggml_backend_t par_next_backend = nullptr;
+
+        if (!sched->callback_eval && par_next_id < sched->n_splits) {
+            ggml_backend_t b1 = sched->backends[splits[par_next_id].backend_id];
+            bool cur_is_gpu  = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            bool next_is_cpu = ggml_backend_dev_type(ggml_backend_get_device(b1))            == GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (cur_is_gpu && next_is_cpu) {
+                par_next             = &splits[par_next_id];
+                par_next_backend_id  = par_next->backend_id;
+                par_next_backend     = b1;
+                // Independence check: none of the next split's inputs can be
+                // nodes produced by the current split.
+                do_parallel = true;
+                for (int in = 0; do_parallel && in < par_next->n_inputs; in++) {
+                    struct ggml_tensor * inp = par_next->inputs[in];
+                    for (int ni = 0; ni < split->graph.n_nodes; ni++) {
+                        if (split->graph.nodes[ni] == inp) { do_parallel = false; break; }
+                    }
+                }
+            }
+        }
+
+        if (!sched->callback_eval && do_parallel) {
+            // Sync the GPU compute stream so that all prior GPU ops (Split A)
+            // are complete before we perform the PCIe copy.
+            ggml_backend_synchronize(split_backend);
+
+            // Pre-copy the CPU split's inputs (GPU→CPU via PCIe).
+            // The GPU compute stream is idle now, so the source data is valid.
+            for (int input_id = 0; input_id < par_next->n_inputs; input_id++) {
+                struct ggml_tensor * inp    = par_next->inputs[input_id];
+                struct ggml_tensor * inp_cp = tensor_copy(inp, par_next_backend_id, sched->cur_copy);
+                ggml_backend_tensor_copy(inp, inp_cp);
+            }
+
+            // Submit the CPU split to the background worker thread.
+            s_sched_cpu_worker.submit([par_next, par_next_backend]() {
+                ggml_backend_graph_compute_async(par_next_backend, &par_next->graph);
+            });
+
+            // Launch the GPU split asynchronously (CUDA kernels enqueue,
+            // returns immediately while the CPU worker runs in parallel).
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (ec != GGML_STATUS_SUCCESS) {
+                s_sched_cpu_worker.join(); // avoid dangling task
+                return ec;
+            }
+
+            // Wait for both: CPU worker first, then GPU sync.
+            s_sched_cpu_worker.join();
+            ggml_backend_synchronize(split_backend);
+
+            // Record events for both handled splits.
+            if (split->n_inputs > 0 && sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
+            if (par_next->n_inputs > 0 && sched->events[par_next_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[par_next_backend_id][sched->cur_copy], par_next_backend);
+            }
+
+            split_id = par_next_id; // next loop increment skips the CPU split
+            continue;
+        } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;

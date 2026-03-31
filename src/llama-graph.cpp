@@ -1006,7 +1006,94 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * gate_cpu,
+         ggml_tensor * up_cpu,
+         ggml_tensor * down_cpu) const {
+
+    // -----------------------------------------------------------------------
+    // Phase C: parallel CPU+GPU FFN split.
+    // When gate_cpu/up_cpu/down_cpu are provided we build TWO sub-FFNs:
+    //   GPU sub-FFN  : uses the original gate/up/down weights (GPU views of
+    //                  the first gpu_rows rows).
+    //   CPU sub-FFN  : uses gate_cpu/up_cpu/down_cpu (pre-copied CPU tensors
+    //                  for the remaining cpu_rows rows).
+    // Both sub-FFNs produce a partial down-projection result of shape
+    // [n_embd, 1].  We add them (the scheduler will auto-copy the CPU partial
+    // result to GPU for the add) to obtain the final FFN output.
+    //
+    // A GGML_TENSOR_FLAG_SCHED_BREAK is set on the first GPU FFN op so that
+    // the scheduler creates a split boundary between the preceding norm/attn
+    // ops and the GPU FFN ops, allowing the GPU FFN and CPU FFN to overlap.
+    // -----------------------------------------------------------------------
+    if (gate_cpu != nullptr && up_cpu != nullptr && down_cpu != nullptr &&
+        type_op == LLM_FFN_SILU && type_gate == LLM_FFN_PAR &&
+        !up_b && !gate_b && !down_b && !up_s && !gate_s && !down_s && !act_scales) {
+
+        // ----- GPU sub-FFN -----
+        // Derive GPU row count from gate_cpu: cpu_rows = gate_cpu->ne[1]
+        int64_t cpu_rows = gate_cpu->ne[1];
+        int64_t n_ff     = gate->ne[1];
+        int64_t gpu_rows = n_ff - cpu_rows;
+
+        // Views of the first gpu_rows rows of gate/up/down (zero extra VRAM)
+        ggml_tensor * gate_gpu_w = ggml_view_2d(ctx0, gate,
+                                                gate->ne[0], gpu_rows,
+                                                gate->nb[1], 0);
+        ggml_tensor * up_gpu_w   = ggml_view_2d(ctx0, up,
+                                                up->ne[0], gpu_rows,
+                                                up->nb[1], 0);
+        // down_gpu view: [gpu_rows, n_embd] — first gpu_rows of ne[0]
+        // This view is non-contiguous (stride = full n_ff row, not gpu_rows row),
+        // so make a contiguous copy for the CUDA mul_mat kernel.
+        // ggml_gallocr reuses this buffer across layers so peak VRAM cost is 1 layer.
+        ggml_tensor * down_gpu_view = ggml_view_2d(ctx0, down,
+                                                    gpu_rows, down->ne[1],
+                                                    down->nb[1], 0);
+        ggml_tensor * down_gpu_w = ggml_cont(ctx0, down_gpu_view);
+
+        // Mark the first GPU FFN op with SCHED_BREAK so the scheduler
+        // creates a split boundary between attn/norm (Split A) and GPU FFN (Split B).
+        ggml_tensor * gate_gpu_out = ggml_mul_mat(ctx0, gate_gpu_w, cur);
+        gate_gpu_out->flags |= GGML_TENSOR_FLAG_SCHED_BREAK;
+        cb(gate_gpu_out, "ffn_gate_gpu", il);
+
+        ggml_tensor * up_gpu_out = ggml_mul_mat(ctx0, up_gpu_w, cur);
+        cb(up_gpu_out, "ffn_up_gpu", il);
+
+        ggml_tensor * gpu_hidden = ggml_swiglu_split(ctx0, gate_gpu_out, up_gpu_out);
+        cb(gpu_hidden, "ffn_swiglu_gpu", il);
+
+        ggml_tensor * gpu_out = ggml_mul_mat(ctx0, down_gpu_w, gpu_hidden);
+        cb(gpu_out, "ffn_down_gpu", il);
+
+        // ----- CPU sub-FFN -----
+        // gate_cpu / up_cpu are [n_embd, cpu_rows] on CPU backend;
+        // down_cpu is [cpu_rows, n_embd] on CPU backend.
+        // The scheduler will automatically copy `cur` from GPU to CPU when it
+        // detects that the CPU op needs it.
+        ggml_tensor * gate_cpu_out = ggml_mul_mat(ctx0, gate_cpu, cur);
+        cb(gate_cpu_out, "ffn_gate_cpu", il);
+
+        ggml_tensor * up_cpu_out = ggml_mul_mat(ctx0, up_cpu, cur);
+        cb(up_cpu_out, "ffn_up_cpu", il);
+
+        ggml_tensor * cpu_hidden = ggml_swiglu_split(ctx0, gate_cpu_out, up_cpu_out);
+        cb(cpu_hidden, "ffn_swiglu_cpu", il);
+
+        ggml_tensor * cpu_out = ggml_mul_mat(ctx0, down_cpu, cpu_hidden);
+        cb(cpu_out, "ffn_down_cpu", il);
+
+        // ----- Merge partial results -----
+        // gpu_out is on GPU, cpu_out is on CPU.
+        // ggml_add with mixed backends: the scheduler auto-copies cpu_out→GPU.
+        ggml_tensor * merged = ggml_add(ctx0, gpu_out, cpu_out);
+        cb(merged, "ffn_out_merged", il);
+
+        return merged;
+    }
+
+    // ------- Standard (non-split) path below -------
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 

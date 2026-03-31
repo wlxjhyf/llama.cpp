@@ -116,7 +116,11 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
                     model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                     NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    LLM_FFN_SILU, LLM_FFN_PAR, il,
+                    // Phase C: CPU split (nullptr = disabled, non-null = split mode)
+                    model.layers[il].ffn_gate_cpu,
+                    model.layers[il].ffn_up_cpu,
+                    model.layers[il].ffn_down_cpu);
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch

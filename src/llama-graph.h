@@ -797,7 +797,11 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+             // Phase C: optional CPU-split weights (nullptr = no split)
+             ggml_tensor * gate_cpu   = nullptr,
+             ggml_tensor * up_cpu     = nullptr,
+             ggml_tensor * down_cpu   = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

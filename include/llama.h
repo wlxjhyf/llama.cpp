@@ -486,6 +486,13 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    // Phase C: Pre-copy the CPU portion of every FFN layer to host RAM so the
+    // GPU and CPU can compute their respective FFN sub-rows in parallel.
+    // r_ffn: fraction of FFN rows kept on GPU (0 < r_ffn < 1).
+    // Must be called after llama_model_load_from_file and before llama_init_from_model.
+    // Returns true on success.
+    LLAMA_API bool llama_model_apply_ffn_cpu_split(struct llama_model * model, float r_ffn);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);

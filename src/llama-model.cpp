@@ -330,6 +330,144 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    if (ffn_cpu_buf) { ggml_backend_buffer_free(ffn_cpu_buf); }
+    if (ffn_cpu_ctx) { ggml_free(ffn_cpu_ctx); }
+}
+
+bool llama_model::apply_ffn_cpu_split(float r_ffn) {
+    if (arch != LLM_ARCH_LLAMA) {
+        LLAMA_LOG_WARN("%s: only LLM_ARCH_LLAMA is supported for FFN CPU split\n", __func__);
+        return false;
+    }
+    if (ffn_cpu_ctx != nullptr) {
+        LLAMA_LOG_WARN("%s: FFN CPU split already applied\n", __func__);
+        return false;
+    }
+    if (layers.empty()) { return false; }
+
+    const int64_t n_layer = (int64_t)hparams.n_layer;
+    const int64_t n_embd  = (int64_t)hparams.n_embd;
+    const int64_t n_ff    = (int64_t)hparams.n_ff();
+    const int64_t blck    = 256; // Q4_K block size
+
+    int64_t gpu_rows = (int64_t)(n_ff * (double)r_ffn / blck) * blck;
+    if (gpu_rows <= 0 || gpu_rows >= n_ff || (n_ff - gpu_rows) % blck != 0) {
+        LLAMA_LOG_ERROR("%s: invalid r_ffn=%f (gpu_rows=%lld, n_ff=%lld)\n",
+                        __func__, (double)r_ffn, (long long)gpu_rows, (long long)n_ff);
+        return false;
+    }
+    int64_t cpu_rows = n_ff - gpu_rows;
+
+    // Validate: every layer with FFN weights must have Q4/Q5/Q6_K types whose
+    // block size is 256, so that gpu_rows/cpu_rows align to block boundaries.
+    for (int il = 0; il < n_layer; il++) {
+        auto & lay = layers[il];
+        if (!lay.ffn_gate || !lay.ffn_up || !lay.ffn_down) { continue; }
+        auto check_type = [&](ggml_tensor * t, const char * name) -> bool {
+            if (ggml_blck_size(t->type) != 256) {
+                LLAMA_LOG_WARN("%s: layer %d %s has block size %d (need 256), skipping split\n",
+                               __func__, il, name, (int)ggml_blck_size(t->type));
+                return false;
+            }
+            return true;
+        };
+        if (!check_type(lay.ffn_gate, "ffn_gate") ||
+            !check_type(lay.ffn_up,   "ffn_up")   ||
+            !check_type(lay.ffn_down, "ffn_down"))  {
+            return false;
+        }
+    }
+
+    // Create ggml context (no_alloc) to hold tensor metadata.
+    // Each layer gets 3 tensors; use the actual type of each source tensor.
+    struct ggml_init_params ctx_p = {
+        /* .mem_size   = */ (size_t)n_layer * 3 * ggml_tensor_overhead() + 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ffn_cpu_ctx = ggml_init(ctx_p);
+    if (!ffn_cpu_ctx) {
+        LLAMA_LOG_ERROR("%s: ggml_init failed\n", __func__);
+        return false;
+    }
+
+    // Register all CPU-split tensors using the source tensor's actual quant type
+    for (int il = 0; il < n_layer; il++) {
+        auto & lay = layers[il];
+        if (!lay.ffn_gate || !lay.ffn_up || !lay.ffn_down) { continue; }
+        // [n_embd, cpu_rows] — match source gate/up type
+        lay.ffn_gate_cpu = ggml_new_tensor_2d(ffn_cpu_ctx, lay.ffn_gate->type, n_embd, cpu_rows);
+        lay.ffn_up_cpu   = ggml_new_tensor_2d(ffn_cpu_ctx, lay.ffn_up->type,   n_embd, cpu_rows);
+        // [cpu_rows, n_embd] — match source down type
+        lay.ffn_down_cpu = ggml_new_tensor_2d(ffn_cpu_ctx, lay.ffn_down->type, cpu_rows, n_embd);
+    }
+
+    // Allocate all tensors in one contiguous CPU buffer
+    ffn_cpu_buf = ggml_backend_alloc_ctx_tensors_from_buft(ffn_cpu_ctx, ggml_backend_cpu_buffer_type());
+    if (!ffn_cpu_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate CPU buffer\n", __func__);
+        ggml_free(ffn_cpu_ctx);
+        ffn_cpu_ctx = nullptr;
+        return false;
+    }
+
+    // Copy weight data from the source tensors (may be on GPU) into the CPU splits.
+    //
+    // gate / up : ne=[n_embd, n_ff], rows [gpu_rows..n_ff-1] are contiguous → one bulk copy.
+    // down      : ne=[n_ff, n_embd], ne[0] slice [gpu_rows..n_ff-1] is non-contiguous
+    //             in memory (interleaved with GPU blocks).  Strategy: bulk-copy the whole
+    //             source tensor into a temp host buffer, then rearrange with memcpy on CPU.
+    //             This avoids tens-of-thousands of tiny CUDA API calls.
+
+    // Temp buffer for one ffn_down tensor (reused across layers)
+    std::vector<uint8_t> down_tmp;
+
+    for (int il = 0; il < n_layer; il++) {
+        auto & lay = layers[il];
+        if (!lay.ffn_gate_cpu || !lay.ffn_up_cpu || !lay.ffn_down_cpu) { continue; }
+        if (!lay.ffn_gate    || !lay.ffn_up    || !lay.ffn_down)    { continue; }
+
+        // ---- gate_cpu / up_cpu: contiguous offset in ne[1] ----
+        // gate/up have ne=[n_embd, n_ff]; rows [gpu_rows..n_ff-1] are contiguous.
+        size_t gate_off  = (size_t)gpu_rows * lay.ffn_gate->nb[1];
+        size_t gate_size = ggml_nbytes(lay.ffn_gate_cpu);  // dst size (same type as src)
+        ggml_backend_tensor_get(lay.ffn_gate, lay.ffn_gate_cpu->data, gate_off, gate_size);
+
+        size_t up_off  = (size_t)gpu_rows * lay.ffn_up->nb[1];
+        size_t up_size = ggml_nbytes(lay.ffn_up_cpu);
+        ggml_backend_tensor_get(lay.ffn_up, lay.ffn_up_cpu->data, up_off, up_size);
+
+        // ---- down_cpu: bulk GPU→host, then CPU-side rearrangement ----
+        // down has ne=[n_ff, n_embd]; the CPU slice [gpu_rows..n_ff-1] of ne[0] is
+        // non-contiguous (interleaved with GPU blocks), so we pull the whole tensor
+        // to host first and then rearrange.
+        size_t src_total = ggml_nbytes(lay.ffn_down);
+        if (down_tmp.size() < src_total) { down_tmp.resize(src_total); }
+        ggml_backend_tensor_get(lay.ffn_down, down_tmp.data(), 0, src_total);
+
+        int64_t gpu_blocks    = gpu_rows / blck;
+        size_t  nb0           = lay.ffn_down->nb[0];               // bytes per quant block
+        size_t  src_row_bytes = lay.ffn_down->nb[1];               // bytes per ne[1] row in src
+        size_t  cpu_row_bytes = (size_t)(cpu_rows / blck) * nb0;   // bytes per ne[1] row in dst
+        uint8_t * dst_ptr        = (uint8_t *)lay.ffn_down_cpu->data;
+        const uint8_t * src_ptr  = down_tmp.data();
+
+        for (int64_t col = 0; col < n_embd; col++) {
+            const uint8_t * src = src_ptr + (size_t)col * src_row_bytes + (size_t)gpu_blocks * nb0;
+            uint8_t       * dst = dst_ptr + (size_t)col * cpu_row_bytes;
+            std::memcpy(dst, src, cpu_row_bytes);
+        }
+
+        if (il % 10 == 0) {
+            LLAMA_LOG_INFO("%s: copying layer %d/%lld\n", __func__, il, (long long)n_layer);
+        }
+    }
+
+    size_t total_mb = ggml_backend_buffer_get_size(ffn_cpu_buf) / (1024 * 1024);
+    LLAMA_LOG_INFO("%s: split FFN: gpu_rows=%lld/%lld (%.1f%%), cpu_rows=%lld, CPU RAM: %zu MB\n",
+                   __func__, (long long)gpu_rows, (long long)n_ff,
+                   100.0 * gpu_rows / n_ff, (long long)cpu_rows, total_mb);
+    return true;
 }
 
 void llama_model::load_stats(llama_model_loader & ml) {
@@ -8845,6 +8983,10 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
     delete model;
+}
+
+bool llama_model_apply_ffn_cpu_split(llama_model * model, float r_ffn) {
+    return model->apply_ffn_cpu_split(r_ffn);
 }
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {

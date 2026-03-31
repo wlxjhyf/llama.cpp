@@ -279,6 +279,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate     = nullptr; // w1
     struct ggml_tensor * ffn_down     = nullptr; // w2
     struct ggml_tensor * ffn_up       = nullptr; // w3
+
+    // CPU split tensors for parallel CPU+GPU FFN (Phase C)
+    // Pre-copied Q4_K CPU portion: ffn_{gate,up,down} rows [gpu_rows..n_ff)
+    struct ggml_tensor * ffn_gate_cpu = nullptr;
+    struct ggml_tensor * ffn_down_cpu = nullptr;
+    struct ggml_tensor * ffn_up_cpu   = nullptr;
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
@@ -551,6 +557,12 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // CPU split for parallel CPU+GPU FFN (Phase C)
+    // When non-null, the model uses split FFN: GPU portion in standard layer
+    // tensors (views), CPU portion pre-copied here.
+    struct ggml_context * ffn_cpu_ctx = nullptr;
+    ggml_backend_buffer_t ffn_cpu_buf = nullptr;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -565,6 +577,13 @@ struct llama_model {
     void load_hparams(llama_model_loader & ml);
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
+
+    // Phase C: pre-copy CPU FFN split rows to host RAM.
+    // r_ffn is the GPU fraction (0 < r_ffn < 1); rows 0..floor(n_ff*r_ffn)-1
+    // (aligned to Q4_K block size 256) stay on GPU; the rest go to CPU.
+    // Only supported for LLM_ARCH_LLAMA with SwiGLU FFN (no bias, no scale).
+    // Returns false if the model architecture is unsupported.
+    bool apply_ffn_cpu_split(float r_ffn);
 
     std::string arch_name() const;
     std::string type_name() const;
