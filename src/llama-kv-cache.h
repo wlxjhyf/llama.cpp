@@ -199,6 +199,11 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // Migrate KV cache tensors to match the model's current device layout
+    // (call after llama_model::migrate_weights).
+    // Returns wall-clock migration time in ms, or -1.0 on failure.
+    double migrate_to_model_layout();
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;

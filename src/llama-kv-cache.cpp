@@ -2282,3 +2282,66 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
 }
+
+// ---------------------------------------------------------------------------
+// KV cache migration
+// ---------------------------------------------------------------------------
+
+// Move a single KV tensor to a new backend buffer type.
+// Same strategy as migrate_tensor in llama-model.cpp: old buffer is orphaned.
+static int64_t migrate_kv_tensor(ggml_tensor * t, ggml_backend_buffer_type_t target_buft) {
+    if (!t || !t->data || !t->buffer) {
+        return 0;
+    }
+    if (ggml_backend_buffer_get_type(t->buffer) == target_buft) {
+        return 0;
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+
+    ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(target_buft, nbytes);
+    if (!new_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, nbytes);
+        return -1;
+    }
+
+    ggml_tensor src_proxy = *t;
+
+    t->data   = ggml_backend_buffer_get_base(new_buf);
+    t->buffer = new_buf;
+    ggml_backend_buffer_init_tensor(new_buf, t);
+
+    ggml_backend_tensor_copy(&src_proxy, t);
+
+    return (int64_t)nbytes;
+}
+
+double llama_kv_cache::migrate_to_model_layout() {
+    const int64_t t0 = ggml_time_us();
+    int64_t bytes_moved = 0;
+
+    for (auto & kv_l : layers) {
+        const int il = (int)kv_l.il;
+
+        // Ask the model for the buffer type that layer il should use now.
+        ggml_backend_buffer_type_t target_buft = model.select_buft(il);
+
+        // Collect all KV tensors for this layer.
+        std::vector<ggml_tensor *> kv_tensors;
+        if (kv_l.k) { kv_tensors.push_back(kv_l.k); }
+        if (kv_l.v) { kv_tensors.push_back(kv_l.v); }
+        for (ggml_tensor * t : kv_l.k_stream) { if (t) kv_tensors.push_back(t); }
+        for (ggml_tensor * t : kv_l.v_stream) { if (t) kv_tensors.push_back(t); }
+
+        for (ggml_tensor * t : kv_tensors) {
+            int64_t b = migrate_kv_tensor(t, target_buft);
+            if (b < 0) { return -1.0; }
+            bytes_moved += b;
+        }
+    }
+
+    const double ms = (ggml_time_us() - t0) / 1000.0;
+    LLAMA_LOG_INFO("%s: migrated KV cache %.1f MB in %.1f ms\n",
+                   __func__, bytes_moved / 1024.0 / 1024.0, ms);
+    return ms;
+}

@@ -592,6 +592,10 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // Migrate weight tensors to a new GPU layer count.
+    // Returns wall-clock migration time in ms, or -1.0 on failure.
+    double migrate_weights(int32_t new_ngl);
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

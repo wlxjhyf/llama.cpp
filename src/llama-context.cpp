@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -703,6 +704,10 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+llama_kv_cache * llama_context::get_kv_cache() const {
+    return dynamic_cast<llama_kv_cache *>(memory.get());
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -3639,4 +3644,31 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime layer migration (context-side wrappers)
+// ---------------------------------------------------------------------------
+
+double llama_context_migrate_kvcache(llama_context * ctx) {
+    auto * kv = ctx->get_kv_cache();
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: memory is not a llama_kv_cache, skipping KV migration\n", __func__);
+        return 0.0;
+    }
+    const double ms = kv->migrate_to_model_layout();
+    if (ms < 0.0) {
+        return -1.0;
+    }
+    // Rebuild scheduler scratch buffers for the new device layout.
+    ctx->sched_reserve();
+    return ms;
+}
+
+double llama_migrate_to_ngl(llama_model * model, llama_context * ctx, int32_t new_ngl) {
+    const double ms_w = llama_model_migrate_weights(model, new_ngl);
+    if (ms_w < 0.0) { return -1.0; }
+    const double ms_kv = llama_context_migrate_kvcache(ctx);
+    if (ms_kv < 0.0) { return -1.0; }
+    return ms_w + ms_kv;
 }

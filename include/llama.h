@@ -629,6 +629,24 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    //
+    // Runtime layer migration
+    //
+
+    // Migrate model weight tensors to a new GPU layer count at runtime.
+    // Does NOT migrate the KV cache; call llama_context_migrate_kvcache afterwards.
+    // Returns wall-clock migration time in ms, or -1.0 on failure.
+    LLAMA_API double llama_model_migrate_weights(struct llama_model * model, int32_t new_ngl);
+
+    // Migrate the context's KV cache to match the model's current device layout.
+    // Must be called after llama_model_migrate_weights when the KV cache is non-empty.
+    // Returns wall-clock migration time in ms, or -1.0 on failure.
+    LLAMA_API double llama_context_migrate_kvcache(struct llama_context * ctx);
+
+    // Combined: migrate weights then KV cache atomically.
+    // Returns total wall-clock time in ms, or -1.0 on failure.
+    LLAMA_API double llama_migrate_to_ngl(struct llama_model * model, struct llama_context * ctx, int32_t new_ngl);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,

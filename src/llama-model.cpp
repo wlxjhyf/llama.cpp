@@ -9186,3 +9186,179 @@ bool llama_model_is_diffusion(const llama_model * model) {
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
 }
+
+double llama_model_migrate_weights(llama_model * model, int32_t new_ngl) {
+    return model->migrate_weights(new_ngl);
+}
+
+// ---------------------------------------------------------------------------
+// Runtime layer migration
+// ---------------------------------------------------------------------------
+
+// Move a single tensor to a new backend buffer type.
+// The original tensor struct is updated in-place; the old buffer is NOT freed
+// (it may be shared with other tensors).
+// Returns bytes transferred, or -1 on failure.
+static int64_t migrate_tensor(ggml_tensor * t, ggml_backend_buffer_type_t target_buft) {
+    if (!t || !t->data || !t->buffer) {
+        return 0;
+    }
+    if (ggml_backend_buffer_get_type(t->buffer) == target_buft) {
+        return 0; // already on target device
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+
+    ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(target_buft, nbytes);
+    if (!new_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate buffer (%zu bytes)\n", __func__, nbytes);
+        return -1;
+    }
+
+    // Stack-copy the tensor metadata so it still points to the OLD data/buffer.
+    // This lets us use ggml_backend_tensor_copy(src, dst) with both sides valid.
+    ggml_tensor src_proxy = *t;
+
+    // Redirect the original tensor to the new buffer.
+    t->data   = ggml_backend_buffer_get_base(new_buf);
+    t->buffer = new_buf;
+    ggml_backend_buffer_init_tensor(new_buf, t);
+
+    // Copy data: src_proxy (old location) → t (new location).
+    ggml_backend_tensor_copy(&src_proxy, t);
+
+    // src_proxy.buffer (the old shared buffer) is intentionally not freed.
+    return (int64_t)nbytes;
+}
+
+// Collect all non-null weight tensors that belong to layer il.
+static std::vector<ggml_tensor *> collect_layer_tensors(llama_layer & layer) {
+    std::vector<ggml_tensor *> ts;
+    auto add = [&](ggml_tensor * t) { if (t) ts.push_back(t); };
+
+    // normalization
+    add(layer.attn_norm);       add(layer.attn_norm_b);
+    add(layer.attn_norm_2);     add(layer.attn_norm_2_b);
+    add(layer.attn_q_norm);     add(layer.attn_q_norm_b);
+    add(layer.attn_k_norm);     add(layer.attn_k_norm_b);
+    add(layer.attn_out_norm);   add(layer.attn_out_norm_b);
+    add(layer.attn_q_a_norm);   add(layer.attn_kv_a_norm);
+    add(layer.attn_sub_norm);   add(layer.attn_post_norm);
+    add(layer.ffn_sub_norm);    add(layer.attn_norm_cross);
+    add(layer.attn_norm_enc);   add(layer.ssm_norm);
+    add(layer.ssm_dt_norm);     add(layer.ssm_b_norm);
+    add(layer.ssm_c_norm);      add(layer.ffn_norm);
+    add(layer.ffn_norm_b);      add(layer.ffn_post_norm);
+    add(layer.layer_out_norm);  add(layer.layer_out_norm_b);
+    add(layer.ffn_norm_exps);   add(layer.ffn_norm_enc);
+
+    // attention
+    add(layer.wq);    add(layer.wk);    add(layer.wv);    add(layer.wo);
+    add(layer.wqkv);  add(layer.wq_a);  add(layer.wq_b);
+    add(layer.wkv_a_mqa); add(layer.wkv_b); add(layer.wk_b); add(layer.wv_b);
+    add(layer.wq_cross);  add(layer.wk_cross);
+    add(layer.wv_cross);  add(layer.wo_cross);
+    add(layer.wq_enc);    add(layer.wk_enc);
+    add(layer.wv_enc);    add(layer.wo_enc);
+    add(layer.wqkv_gate);
+
+    // attention bias
+    add(layer.bq); add(layer.bk); add(layer.bv); add(layer.bo); add(layer.bqkv);
+
+    // relative position bias
+    add(layer.attn_rel_b); add(layer.attn_rel_b_enc); add(layer.attn_rel_b_cross);
+
+    // feed-forward
+    add(layer.ffn_gate);     add(layer.ffn_down);     add(layer.ffn_up);
+    add(layer.ffn_gate_enc); add(layer.ffn_down_enc); add(layer.ffn_up_enc);
+    add(layer.ffn_gate_b);   add(layer.ffn_down_b);   add(layer.ffn_up_b);
+    add(layer.ffn_act);
+
+    // MoE
+    add(layer.ffn_gate_inp);   add(layer.ffn_gate_exps);
+    add(layer.ffn_down_exps);  add(layer.ffn_up_exps);
+    add(layer.ffn_gate_inp_shexp); add(layer.ffn_gate_shexp);
+    add(layer.ffn_down_shexp); add(layer.ffn_up_shexp);
+    add(layer.ffn_gate_up_exps);
+
+    // SSM
+    add(layer.ssm_in);  add(layer.ssm_conv1d); add(layer.ssm_x);
+    add(layer.ssm_dt);  add(layer.ssm_a);      add(layer.ssm_d);
+    add(layer.ssm_out);
+
+    // rope
+    add(layer.rope_freqs); add(layer.rope_long); add(layer.rope_short);
+
+
+    return ts;
+}
+
+double llama_model::migrate_weights(int32_t new_ngl) {
+    const int n_layer = (int)hparams.n_layer;
+
+    // Clamp to valid range.
+    new_ngl = std::max(0, std::min(new_ngl, n_layer));
+
+    const int old_ngl    = (int)n_gpu_layers();
+    const int old_start  = std::max(n_layer + 1 - old_ngl, 0);
+    const int new_start  = std::max(n_layer + 1 - new_ngl, 0);
+
+    if (old_ngl == new_ngl) {
+        LLAMA_LOG_INFO("%s: ngl already %d, nothing to do\n", __func__, new_ngl);
+        return 0.0;
+    }
+
+    // Determine buffer types for CPU and GPU.
+    ggml_backend_buffer_type_t cpu_buft = pimpl->cpu_buft_list.empty()
+        ? nullptr : pimpl->cpu_buft_list[0].second;
+
+    ggml_backend_buffer_type_t gpu_buft = nullptr;
+    if (!devices.empty()) {
+        auto it = pimpl->gpu_buft_list.find(devices[0]);
+        if (it != pimpl->gpu_buft_list.end() && !it->second.empty()) {
+            gpu_buft = it->second[0].second;
+        }
+    }
+
+    if (!cpu_buft) {
+        LLAMA_LOG_ERROR("%s: no CPU buffer type available\n", __func__);
+        return -1.0;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    int64_t bytes_moved = 0;
+
+    // GPU → CPU: layers that were on GPU but are now below new_start.
+    for (int il = old_start; il < new_start && il < n_layer; ++il) {
+        LLAMA_LOG_INFO("%s: layer %d  GPU → CPU\n", __func__, il);
+        for (ggml_tensor * t : collect_layer_tensors(layers[il])) {
+            int64_t b = migrate_tensor(t, cpu_buft);
+            if (b < 0) { return -1.0; }
+            bytes_moved += b;
+        }
+        pimpl->dev_layer[il] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
+                                  &pimpl->cpu_buft_list };
+    }
+
+    // CPU → GPU: layers that were on CPU but are now at or above new_start.
+    if (gpu_buft) {
+        for (int il = new_start; il < old_start && il < n_layer; ++il) {
+            LLAMA_LOG_INFO("%s: layer %d  CPU → GPU\n", __func__, il);
+            for (ggml_tensor * t : collect_layer_tensors(layers[il])) {
+                int64_t b = migrate_tensor(t, gpu_buft);
+                if (b < 0) { return -1.0; }
+                bytes_moved += b;
+            }
+            ggml_backend_dev_t gpu_dev = devices[0];
+            pimpl->dev_layer[il] = { gpu_dev, &pimpl->gpu_buft_list.at(gpu_dev) };
+        }
+    }
+
+    params.n_gpu_layers = new_ngl;
+
+    const double ms = (ggml_time_us() - t0) / 1000.0;
+    LLAMA_LOG_INFO("%s: migrated %d → %d layers, %.1f MB, %.1f ms\n",
+                   __func__, old_ngl, new_ngl,
+                   bytes_moved / 1024.0 / 1024.0, ms);
+    return ms;
+}
