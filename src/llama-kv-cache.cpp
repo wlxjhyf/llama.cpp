@@ -2297,6 +2297,14 @@ static int64_t migrate_kv_tensor(ggml_tensor * t, ggml_backend_buffer_type_t tar
         return 0;
     }
 
+    // View tensors share data with their view_src. After the view_src has been
+    // migrated, just update the view's pointers to track the new location.
+    if (t->view_src != nullptr) {
+        t->data   = (char *) t->view_src->data + t->view_offs;
+        t->buffer = t->view_src->buffer;
+        return 0;
+    }
+
     const size_t nbytes = ggml_nbytes(t);
 
     ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(target_buft, nbytes);

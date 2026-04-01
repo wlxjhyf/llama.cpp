@@ -12,6 +12,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -22,10 +23,11 @@
 static std::vector<llama_token> tokenize(const llama_model * model,
                                           const std::string & text,
                                           bool add_bos) {
-    const int n = -llama_tokenize(model, text.c_str(), (int)text.size(),
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n = -llama_tokenize(vocab, text.c_str(), (int)text.size(),
                                   nullptr, 0, add_bos, true);
     std::vector<llama_token> tokens(n);
-    llama_tokenize(model, text.c_str(), (int)text.size(),
+    llama_tokenize(vocab, text.c_str(), (int)text.size(),
                    tokens.data(), n, add_bos, true);
     return tokens;
 }
@@ -51,9 +53,10 @@ static std::vector<llama_token> run_greedy(llama_context * ctx,
     std::vector<llama_token> out;
     out.reserve(n_gen);
 
-    llama_token cur = llama_sampler_sample(
-        llama_sampler_chain_init(llama_sampler_chain_default_params()),
-        ctx, -1);
+    auto * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    llama_token cur = llama_sampler_sample(smpl, ctx, -1);
+    llama_sampler_free(smpl);
 
     for (int i = 0; i < n_gen; ++i) {
         out.push_back(cur);
