@@ -24,6 +24,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -320,6 +321,15 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // CPU mirror: when a tensor is migrated CPU→GPU, we save its original CPU
+    // buffer and data pointer here.  On GPU→CPU migration we can restore the
+    // pointer directly (zero PCIe copy) instead of copying back from the GPU.
+    struct cpu_mirror_entry {
+        ggml_backend_buffer_t buf;
+        void *                data;
+    };
+    std::unordered_map<ggml_tensor *, cpu_mirror_entry> cpu_mirror;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -9332,9 +9342,22 @@ double llama_model::migrate_weights(int32_t new_ngl) {
     for (int il = old_start; il < new_start && il < n_layer; ++il) {
         LLAMA_LOG_INFO("%s: layer %d  GPU → CPU\n", __func__, il);
         for (ggml_tensor * t : collect_layer_tensors(layers[il])) {
-            int64_t b = migrate_tensor(t, cpu_buft);
-            if (b < 0) { return -1.0; }
-            bytes_moved += b;
+            auto it = pimpl->cpu_mirror.find(t);
+            if (it != pimpl->cpu_mirror.end()) {
+                // Fast path: restore the original CPU buffer, free the GPU buffer.
+                // No PCIe transfer needed — the data never changed on the CPU side.
+                ggml_backend_buffer_t gpu_buf = t->buffer;
+                t->buffer = it->second.buf;
+                t->data   = it->second.data;
+                ggml_backend_buffer_free(gpu_buf);
+                bytes_moved += (int64_t)ggml_nbytes(t);
+                pimpl->cpu_mirror.erase(it);
+            } else {
+                // Slow path: no mirror available, copy from GPU.
+                int64_t b = migrate_tensor(t, cpu_buft);
+                if (b < 0) { return -1.0; }
+                bytes_moved += b;
+            }
         }
         pimpl->dev_layer[il] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
                                   &pimpl->cpu_buft_list };
@@ -9345,6 +9368,10 @@ double llama_model::migrate_weights(int32_t new_ngl) {
         for (int il = new_start; il < old_start && il < n_layer; ++il) {
             LLAMA_LOG_INFO("%s: layer %d  CPU → GPU\n", __func__, il);
             for (ggml_tensor * t : collect_layer_tensors(layers[il])) {
+                // Save CPU mirror before migrating so GPU→CPU can take the fast path.
+                if (t && t->buffer) {
+                    pimpl->cpu_mirror[t] = { t->buffer, t->data };
+                }
                 int64_t b = migrate_tensor(t, gpu_buft);
                 if (b < 0) { return -1.0; }
                 bytes_moved += b;

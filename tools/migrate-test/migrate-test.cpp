@@ -127,8 +127,8 @@ int main(int argc, char ** argv) {
     printf("Generated %d tokens.\n", (int)baseline.size());
 
     // --- migration loop ---
-    printf("\n%-10s %-14s %-12s %-10s\n", "Target ngl", "Weight ms", "KV ms", "Match?");
-    printf("%-10s %-14s %-12s %-10s\n", "----------", "---------", "-----", "------");
+    printf("\n%-10s %-14s %-12s %-12s %-10s\n", "Target ngl", "Weight ms", "KV ms", "Warmup ms", "Match?");
+    printf("%-10s %-14s %-12s %-12s %-10s\n", "----------", "---------", "-----", "---------", "------");
 
     int current_ngl = init_ngl;
     bool all_ok = true;
@@ -145,13 +145,24 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        // verify
+        // Measure first-token latency after migration (includes CUDA graph warmup).
+        double ms_warmup = 0.0;
+        {
+            llama_memory_clear(llama_get_memory(ctx), false);
+            llama_batch batch = llama_batch_get_one(
+                const_cast<llama_token *>(prompt_tokens.data()), (int)prompt_tokens.size());
+            const int64_t t0 = ggml_time_us();
+            llama_decode(ctx, batch);
+            ms_warmup = (ggml_time_us() - t0) / 1000.0;
+        }
+
+        // verify (reuse the already-warmed graph)
         const auto result = run_greedy(ctx, model, prompt_tokens, n_gen);
         const bool match  = (result == baseline);
         if (!match) all_ok = false;
 
-        printf("%-10d %-14.1f %-12.1f %-10s\n",
-               target, ms_w, ms_kv, match ? "YES" : "NO !!!");
+        printf("%-10d %-14.1f %-12.1f %-12.1f %-10s\n",
+               target, ms_w, ms_kv, ms_warmup, match ? "YES" : "NO !!!");
 
         current_ngl = target;
     }

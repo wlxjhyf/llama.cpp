@@ -385,8 +385,8 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-void llama_context::sched_reserve() {
-    if (!sched_need_reserve) {
+void llama_context::sched_reserve(bool force) {
+    if (!force && !sched_need_reserve) {
         return;
     }
 
@@ -3660,8 +3660,9 @@ double llama_context_migrate_kvcache(llama_context * ctx) {
     if (ms < 0.0) {
         return -1.0;
     }
-    // Rebuild scheduler scratch buffers for the new device layout.
-    ctx->sched_reserve();
+    // Weight migration changes the device layout; force scheduler rebuild so
+    // the new compute routes and buffer sizes match the migrated tensors.
+    ctx->sched_reserve(/*force=*/true);
     return ms;
 }
 
